@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>AnyRouter Quota</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body class="tone-idle">
+    <!-- Access Token 设置弹窗 -->
+    <div class="modal" id="keyModal" hidden>
+      <div class="modal-card">
+        <div class="modal-header">
+          <p class="modal-heading">设置访问凭据</p>
+          <a class="modal-link" href="https://anyrouter.top/console/personal" target="_blank" rel="noopener">
+            去控制台获取
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+              <polyline points="15 3 21 3 21 9"/>
+              <line x1="10" y1="14" x2="21" y2="3"/>
+            </svg>
+          </a>
+        </div>
+        <form id="configForm">
+          <label class="field">
+            <span class="field-label">用户 ID</span>
+            <input
+              id="userIdInput"
+              name="userId"
+              type="text"
+              inputmode="numeric"
+              placeholder="例如 12345"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </label>
+          <label class="field">
+            <span class="field-label">Access Token</span>
+            <input
+              id="accessTokenInput"
+              name="accessToken"
+              type="password"
+              placeholder="控制台「访问令牌」"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </label>
+          <p class="field-hint">用户 ID 与 Access Token 均可在 AnyRouter 控制台「个人设置」获取。</p>
+          <div class="modal-actions">
+            <button type="button" id="cancelKeyBtn" class="btn-ghost">取消</button>
+            <button type="submit" class="btn-fill">保存</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <main class="panel">
+      <!-- 顶栏 -->
+      <header class="topbar">
+        <div class="status-group">
+          <span class="dot" id="statusDot"></span>
+          <span class="status-text" id="statusLabel">未配置</span>
+        </div>
+        <div class="toolbar">
+          <button class="icon-btn" id="refreshButton" type="button" title="刷新额度">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20 6v5h-5"/><path d="M4 18v-5h5"/>
+              <path d="M18.2 9A7 7 0 0 0 6.5 6.2L4 8.6"/>
+              <path d="M5.8 15A7 7 0 0 0 17.5 17.8L20 15.4"/>
+            </svg>
+          </button>
+          <button class="icon-btn icon-btn-accent" id="openKeyBtn" type="button" title="设置访问凭据">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="7.5" cy="15.5" r="5.5"/>
+              <path d="M21 2l-9.6 9.6"/>
+              <path d="M15.5 7.5l3 3L22 7l-3-3"/>
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- 提示 -->
+      <div class="alert" id="alertBox" hidden></div>
+
+      <!-- 数据视图 -->
+      <section id="summaryView" hidden>
+        <div class="hero">
+          <div class="hero-text">
+            <p class="hero-label">实时可用额度</p>
+            <p class="hero-val" id="remainingValue">$0.00</p>
+          </div>
+          <span class="badge" id="badgePreview">0</span>
+        </div>
+
+        <div class="progress-section">
+          <div class="track"><span class="fill" id="usageBar"></span></div>
+          <div class="track-meta">
+            <span>本周 <b id="weekPercent">0%</b></span>
+            <span id="updatedAt">未刷新</span>
+          </div>
+        </div>
+
+        <div class="quads">
+          <div class="quad"><span>本周已用</span><b id="weekUsed">$0.00</b></div>
+          <div class="quad"><span>周限额度</span><b id="weekBudget">$0.00</b></div>
+          <div class="quad"><span>今日消费</span><b id="todayUsed">$0.00</b></div>
+        </div>
+
+        <div class="cells">
+          <div class="cell"><span>今日调用</span><b id="todayCalls">0</b></div>
+          <div class="cell"><span>今日 Token</span><b id="todayTokens">0</b></div>
+          <div class="cell"><span>日限额度</span><b id="dailyBudget">$0.00</b></div>
+          <div class="cell"><span>本周调用</span><b id="weekCalls">0</b></div>
+          <div class="cell"><span>总请求次数</span><b id="totalRequests">0</b></div>
+          <div class="cell"><span>总使用额度</span><b id="totalUsed">$0.00</b></div>
+          <div class="cell"><span>总使用 Token</span><b id="totalTokens">0</b></div>
+          <div class="cell"><span>RPM</span><b id="rpm">0</b></div>
+        </div>
+      </section>
+
+      <!-- 空状态 -->
+      <section class="empty" id="emptyState">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="7.5" cy="15.5" r="5.5"/>
+          <path d="M21 2l-9.6 9.6"/>
+          <path d="M15.5 7.5l3 3L22 7l-3-3"/>
+        </svg>
+        <p>点击右上角钥匙按钮<br>填写用户 ID 与 Access Token 开始使用</p>
+      </section>
+    </main>
+
+    <script src="usage.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>
