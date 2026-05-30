@@ -36,9 +36,11 @@ const getSnapshot = async () => {
   return result[UsageQuota.SNAPSHOT_KEY] || null;
 };
 
-const setSnapshot = async (snapshot) => {
+const setSnapshot = async (snapshot, { renderActionState = true } = {}) => {
   await storageSet({ [UsageQuota.SNAPSHOT_KEY]: snapshot });
-  await renderAction(snapshot);
+  if (renderActionState) {
+    await renderAction(snapshot);
+  }
   return snapshot;
 };
 
@@ -93,12 +95,10 @@ const getActionState = (snapshot) => {
     let tone;
     if (isAiDown) {
       tone = "danger";                         // 唯一的红色来源：AI 崩溃告警
-    } else if (isStale) {
-      tone = "stale";                          // 琥珀：经 anyrouter.top 抓取额度失败、展示旧数据（非红）
     } else if (data.status.tone === "danger") {
       tone = "warn";                           // 额度耗尽/极低 → 橙色，不与 AI 告警的红色混淆
     } else {
-      tone = data.status.tone;                 // good / warn
+      tone = data.status.tone;                 // good / warn：stale 快照（仅 onStartup 重绘）沿用上次额度色，保持原样
     }
     const badge = isAiDown ? "AI!" : data.badgeText;
 
@@ -412,12 +412,6 @@ const fetchUsage = async ({ forceProbe = false } = {}) => {
     });
   }
 
-  await renderAction({
-    state: "loading",
-    data: previous?.data || null,
-    updatedAt: previous?.updatedAt || null,
-  });
-
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
@@ -552,15 +546,19 @@ const fetchUsage = async ({ forceProbe = false } = {}) => {
     // health 可能从「AI 异常（手动）」回落，顺带清掉残留的故障通知（本轮没探测，不会误报新故障）
     await maybeNotifyHealth(previous?.data?.health, staleData?.health, healthEnabled);
 
-    return setSnapshot({
-      state: staleData ? "stale" : "error",
-      updatedAt: previous?.updatedAt || null,
-      failedAt: Date.now(),
-      errorMessage: message,
-      data: staleData,
-      probeState,
-      activityState: previous?.activityState, // 抓取失败：活跃状态原样保留，下个 tick 再判定
-    });
+    // 刷新失败只写入快照给弹窗展示，不更新工具栏图标/徽标
+    return setSnapshot(
+      {
+        state: staleData ? "stale" : "error",
+        updatedAt: previous?.updatedAt || null,
+        failedAt: Date.now(),
+        errorMessage: message,
+        data: staleData,
+        probeState,
+        activityState: previous?.activityState, // 抓取失败：活跃状态原样保留，下个 tick 再判定
+      },
+      { renderActionState: false }
+    );
   } finally {
     clearTimeout(timeout);
   }
