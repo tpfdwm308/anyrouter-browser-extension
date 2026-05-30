@@ -10,7 +10,6 @@ const el = {
   emptyState:          $("emptyState"),
   healthCard:          $("healthCard"),
   healthDesc:          $("healthDesc"),
-  healthGap:           $("healthGap"),
   healthLabel:         $("healthLabel"),
   healthLastTs:        $("healthLastTs"),
   healthPulse:         $("healthPulse"),
@@ -22,6 +21,7 @@ const el = {
   remainingValue:      $("remainingValue"),
   rpm:                 $("rpm"),
   statusLabel:         $("statusLabel"),
+  statusNote:          $("statusNote"),
   summaryView:         $("summaryView"),
   todayCalls:          $("todayCalls"),
   todayTokens:         $("todayTokens"),
@@ -54,6 +54,12 @@ const showAlert = (message) => {
   el.alertBox.textContent = message || "";
 };
 
+// 顶栏「数据过期」后面的内联失败原因，省去独立的提示条
+const setStatusNote = (message) => {
+  el.statusNote.hidden = !message;
+  el.statusNote.textContent = message || "";
+};
+
 const setTone = (tone) => {
   document.body.className = `tone-${tone || "idle"}`;
 };
@@ -81,6 +87,7 @@ const closeKeyModal = () => {
 const renderUnconfigured = (message) => {
   setTone("idle");
   set(el.statusLabel, "未配置");
+  setStatusNote("");
   el.summaryView.hidden = true;
   el.emptyState.hidden = false;
   showAlert(message || "");
@@ -102,6 +109,7 @@ const renderSnapshot = (snapshot, config) => {
   if (!snapshot?.data) {
     setTone(snapshot?.state === "error" ? "error" : "idle");
     set(el.statusLabel, snapshot?.state === "error" ? "查询失败" : "等待刷新");
+    setStatusNote("");
     el.summaryView.hidden = true;
     showAlert(snapshot?.errorMessage || "保存凭据后点击刷新，获取额度数据。");
     return;
@@ -113,7 +121,9 @@ const renderSnapshot = (snapshot, config) => {
 
   setTone(tone);
   set(el.statusLabel, isStale ? "数据过期" : data.status.label);
-  showAlert(isStale ? `刷新失败：${snapshot.errorMessage || "请稍后重试"}` : "");
+  // 刷新失败原因紧跟在「数据过期」后面，不再单独占一条提示
+  setStatusNote(isStale ? `刷新失败：${snapshot.errorMessage || "请稍后重试"}` : "");
+  showAlert("");
 
   el.summaryView.hidden = false;
 
@@ -134,7 +144,6 @@ const renderSnapshot = (snapshot, config) => {
   set(el.healthLabel,  health.label);
   set(el.healthDesc,   health.description || "");
   set(el.healthLastTs, health.lastSuccessText || "-");
-  set(el.healthGap,    health.metaText && health.metaText !== "-" ? health.metaText : "");
 };
 
 const loadState = async () => {

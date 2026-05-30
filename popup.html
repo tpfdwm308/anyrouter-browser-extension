@@ -82,6 +82,7 @@
         <div class="status-group">
           <span class="dot" id="statusDot"></span>
           <span class="status-text" id="statusLabel">未配置</span>
+          <span class="status-note" id="statusNote" hidden></span>
         </div>
         <div class="toolbar">
           <button class="icon-btn" id="refreshButton" type="button" title="刷新额度">
@@ -111,9 +112,8 @@
           <div class="health-row">
             <span class="health-pulse" id="healthPulse"></span>
             <span class="health-label" id="healthLabel">未知</span>
-            <span class="health-gap" id="healthGap">-</span>
+            <span class="health-desc" id="healthDesc">尚未发起探测，等待下次刷新。</span>
           </div>
-          <p class="health-desc" id="healthDesc">尚未发起探测，等待下次刷新。</p>
           <p class="health-meta">上次成功 <b id="healthLastTs">-</b></p>
         </div>
 
