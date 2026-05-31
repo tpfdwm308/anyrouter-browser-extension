@@ -9,10 +9,7 @@ const el = {
   configForm:          $("configForm"),
   emptyState:          $("emptyState"),
   healthCard:          $("healthCard"),
-  healthDesc:          $("healthDesc"),
-  healthLabel:         $("healthLabel"),
-  healthLastTs:        $("healthLastTs"),
-  healthPulse:         $("healthPulse"),
+  healthTargets:       $("healthTargets"),
   historyUsed:         $("historyUsed"),
   keyModal:            $("keyModal"),
   openKeyBtn:          $("openKeyBtn"),
@@ -64,6 +61,13 @@ const setTone = (tone) => {
   document.body.className = `tone-${tone || "idle"}`;
 };
 
+// 额度块（hero/quads/cells）整体显隐——仅探测模式下隐藏，只留 AI 健康卡片
+const setQuotaVisible = (visible) => {
+  document.querySelectorAll(".hero, .quads, .cells").forEach((node) => {
+    node.hidden = !visible;
+  });
+};
+
 const openKeyModal = async () => {
   const result = await storageGet(UsageQuota.CONFIG_KEY);
   const config = result[UsageQuota.CONFIG_KEY] || {};
@@ -93,9 +97,100 @@ const renderUnconfigured = (message) => {
   showAlert(message || "");
 };
 
+// 渲染 AI 健康卡片：逐条线路（主站 / 大陆直连）各一行；卡片整体 data-state 取聚合 health（两条都挂才红框）。
+// health.targets 为空（缺令牌 / 已关闭 / 旧快照）时回退成单行聚合状态。
+const renderHealthTargets = (health) => {
+  const card = el.healthCard;
+  const container = el.healthTargets;
+  if (!card || !container) return;
+
+  const agg = health || { state: "unknown", label: "未检测", description: "", metaText: "-" };
+  card.dataset.state = agg.state || "unknown";
+  container.replaceChildren();
+
+  const rows =
+    Array.isArray(agg.targets) && agg.targets.length > 0
+      ? agg.targets
+      : [{ ...agg, name: "AI 探测", host: "" }]; // 回退：无分线路数据时显示单行聚合状态
+
+  for (const row of rows) {
+    const routeEl = document.createElement("div");
+    routeEl.className = "health-route";
+    routeEl.dataset.state = row.state || "unknown";
+
+    const top = document.createElement("div");
+    top.className = "health-route-top";
+
+    const dot = document.createElement("span");
+    dot.className = "health-pulse";
+    top.appendChild(dot);
+
+    const name = document.createElement("span");
+    name.className = "health-route-name";
+    name.textContent = row.name || "AI 探测";
+    top.appendChild(name);
+
+    const label = document.createElement("span");
+    label.className = "health-route-label";
+    label.textContent = row.label || "";
+    top.appendChild(label);
+
+    const meta = document.createElement("span");
+    meta.className = "health-route-meta";
+    meta.textContent = row.metaText || "";
+    top.appendChild(meta);
+
+    routeEl.appendChild(top);
+
+    const desc = document.createElement("div");
+    desc.className = "health-route-desc";
+    const host = row.host ? `${row.host} · ` : "";
+    desc.textContent = `${host}${row.description || ""}`;
+    routeEl.appendChild(desc);
+
+    container.appendChild(routeEl);
+  }
+};
+
+// 未登录（或登录失效）但配了 API 令牌：只展示 AI 站点检测卡片，隐藏额度块
+const renderProbeOnly = (snapshot, config) => {
+  const health =
+    snapshot?.health || UsageQuota.computeHealth(snapshot?.probeState, config);
+  const down = health.state === "unhealthy";
+  // 区分「从未登录」与「登录已失效」（有凭据但被服务端拒绝）
+  const hasCreds = UsageQuota.hasValidConfig(config);
+
+  setTone(down ? "danger" : "idle");
+  set(el.statusLabel, "仅检测");
+  setStatusNote("");
+  el.emptyState.hidden = true;
+  el.summaryView.hidden = false;
+  setQuotaVisible(false);
+  showAlert(
+    hasCreds
+      ? "登录已失效：仅站点检测可用。请在设置中更新 Access Token 以恢复额度查询。"
+      : "未登录：仅站点检测可用。填写用户 ID + Access Token 可查看额度。"
+  );
+
+  renderHealthTargets(health);
+};
+
 const renderSnapshot = (snapshot, config) => {
-  if (!UsageQuota.hasValidConfig(config)) {
-    renderUnconfigured();
+  const loggedIn = UsageQuota.hasValidConfig(config);
+
+  // 仅探测快照（未登录或登录失效但有 API 令牌）：只展示 AI 健康卡片，隐藏额度块
+  if (snapshot?.state === "probe-only") {
+    renderProbeOnly(snapshot, config);
+    return;
+  }
+
+  if (!loggedIn) {
+    // 未登录但配了 API 令牌：即便后台还没探测，也展示检测卡片邀请手动探测
+    if (UsageQuota.hasValidApiToken(config)) {
+      renderProbeOnly(snapshot, config);
+      return;
+    }
+    renderUnconfigured(snapshot?.errorMessage || "");
     return;
   }
 
@@ -105,6 +200,7 @@ const renderSnapshot = (snapshot, config) => {
   }
 
   el.emptyState.hidden = true;
+  setQuotaVisible(true);
 
   if (!snapshot?.data) {
     setTone(snapshot?.state === "error" ? "error" : "idle");
@@ -138,12 +234,9 @@ const renderSnapshot = (snapshot, config) => {
   set(el.rpm,               data.formatted.rpm);
   set(el.tpm,               data.formatted.tpm);
 
-  // 渲染 AI 健康卡片
-  const health = data.health || { state: "unknown", label: "未检测", description: "", metaText: "-", lastSuccessText: "-" };
-  el.healthCard.dataset.state = health.state;
-  set(el.healthLabel,  health.label);
-  set(el.healthDesc,   health.description || "");
-  set(el.healthLastTs, health.lastSuccessText || "-");
+  // 渲染 AI 健康卡片（逐条线路：主站 / 大陆直连）
+  const health = data.health || { state: "unknown", label: "未检测", description: "", metaText: "-", targets: [] };
+  renderHealthTargets(health);
 };
 
 const loadState = async () => {
@@ -187,14 +280,15 @@ el.configForm.addEventListener("submit", async (event) => {
   const apiToken = UsageQuota.normalizeApiToken(el.apiTokenInput.value);
   const refreshMinutes = UsageQuota.normalizeRefreshMinutes(el.refreshMinutesInput.value);
 
-  if (!userId) {
-    el.userIdInput.focus();
-    showAlert("请输入有效的用户 ID");
-    return;
-  }
-  if (!accessToken) {
-    el.accessTokenInput.focus();
-    showAlert("请输入 Access Token");
+  const hasLogin = Boolean(userId) && Boolean(accessToken);
+  const hasProbe = Boolean(apiToken);
+
+  // 至少要能做点什么：完整登录（查额度）或填了 API 令牌（检测站点）
+  if (!hasLogin && !hasProbe) {
+    if (userId && !accessToken) el.accessTokenInput.focus();
+    else if (!userId && accessToken) el.userIdInput.focus();
+    else el.apiTokenInput.focus();
+    showAlert("请至少填写 API 令牌（用于检测站点），或同时填写用户 ID + Access Token（用于查询额度）。");
     return;
   }
 

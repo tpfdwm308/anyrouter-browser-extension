@@ -45,12 +45,12 @@
             />
           </label>
           <label class="field">
-            <span class="field-label">API 令牌（用于 AI 主动探测）</span>
+            <span class="field-label">API 令牌（站点检测用，可单独使用）</span>
             <input
               id="apiTokenInput"
               name="apiToken"
               type="password"
-              placeholder="控制台「API 令牌」，留空则关闭探测"
+              placeholder="控制台「API 令牌」，仅填它即可检测站点"
               autocomplete="off"
               spellcheck="false"
             />
@@ -107,14 +107,9 @@
 
       <!-- 数据视图 -->
       <section id="summaryView" hidden>
-        <!-- AI 健康状态卡片 -->
+        <!-- AI 健康状态卡片：逐条展示各线路（主站 / 大陆直连），由 popup.js 动态填充 -->
         <div class="health" id="healthCard">
-          <div class="health-row">
-            <span class="health-pulse" id="healthPulse"></span>
-            <span class="health-label" id="healthLabel">未知</span>
-            <span class="health-desc" id="healthDesc">尚未发起探测，等待下次刷新。</span>
-          </div>
-          <p class="health-meta">上次成功 <b id="healthLastTs">-</b></p>
+          <div class="health-targets" id="healthTargets"></div>
         </div>
 
         <div class="hero">
@@ -147,7 +142,7 @@
           <path d="M21 2l-9.6 9.6"/>
           <path d="M15.5 7.5l3 3L22 7l-3-3"/>
         </svg>
-        <p>点击右上角钥匙按钮<br>填写用户 ID 与 Access Token 开始使用</p>
+        <p>点击右上角钥匙按钮<br>仅填 API 令牌即可检测站点<br>填用户 ID + Access Token 可查额度</p>
       </section>
     </main>
 

@@ -9,6 +9,12 @@
   // 探测专用后端：大陆网络优化直连地址（独立于额度接口的 siteUrl）
   const PROBE_BASE_URL = "https://a-ocnfniawgw.cn-shanghai.fcapp.run";
   const PROBE_MODEL = "claude-haiku-4-5-20251001";
+  // 探测线路清单：主站与大陆直连后端各探一次，两条结果都展示。
+  // 主站在前，与「同时探测 anyrouter.top 和 fcapp.run」的列举顺序一致。
+  const PROBE_TARGETS = [
+    { key: "main", name: "主站", baseUrl: ANYROUTER_BASE_URL }, // https://anyrouter.top
+    { key: "cn", name: "大陆直连", baseUrl: PROBE_BASE_URL }, // a-ocnfniawgw.cn-shanghai.fcapp.run
+  ];
   const PROBE_ANTHROPIC_VERSION = "2023-06-01";
   const PROBE_TIMEOUT_MS = 15000;
   const CONFIG_KEY = "anyrouterQuotaConfig";
@@ -71,6 +77,15 @@
       return `${u.protocol}//${u.host}`;
     } catch (error) {
       return ANYROUTER_BASE_URL;
+    }
+  };
+
+  // 取 URL 主机名做展示（如 anyrouter.top）；非法串原样回退
+  const hostOf = (url) => {
+    try {
+      return new URL(url).host;
+    } catch (error) {
+      return String(url || "");
     }
   };
 
@@ -146,8 +161,8 @@
     Accept: "application/json",
   });
 
-  // 探测固定走大陆优化后端，不受额度接口 siteUrl 影响
-  const buildProbeUrl = (config) => new URL(PROBE_PATH, PROBE_BASE_URL).toString();
+  // 按给定 baseUrl 拼探测端点（/v1/messages）；缺省回退大陆优化后端
+  const buildProbeUrl = (baseUrl) => new URL(PROBE_PATH, baseUrl || PROBE_BASE_URL).toString();
 
   // AnyRouter 是 Anthropic 协议代理，使用 /v1/messages + x-api-key
   const buildProbeHeaders = (config) => ({
@@ -304,41 +319,13 @@
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   };
 
-  // 主动探测的健康状态。健康字段：
-  // { state, tone, label, description, metaText (副标签：耗时或相对时间), lastSuccessText, lastSuccessTs }
-  const computeHealth = (probeState, config) => {
-    const enabled = normalizeHealthEnabled(config);
-    const ps0 = probeState || {};
-    // 关闭自动监测时，仍展示「最近一次手动探测」（点右上角刷新触发）的结果；
-    // 普通刷新一旦不再探测会清空 source，从而回落到「已关闭」
-    const hasManualProbe = ps0.source === "manual" && toNumber(ps0.lastCheckedAt) > 0;
-
-    // 没有 API 令牌时根本无法探测：优先提示（无论开关状态），避免「已关闭」却让用户点刷新探测的矛盾
-    if (!hasValidApiToken(config)) {
-      return {
-        state: "no-token",
-        tone: "idle",
-        label: "缺少 API 令牌",
-        description: "未配置 API 令牌，无法进行主动探测。",
-        metaText: "-",
-        lastSuccessText: "-",
-        lastSuccessTs: 0,
-      };
-    }
-
-    if (!enabled && !hasManualProbe) {
-      return {
-        state: "disabled",
-        tone: "idle",
-        label: "已关闭",
-        description: "自动检测已关闭（刷新间隔为 0）。点击右上角刷新按钮可手动探测一次，或将刷新间隔设为大于 0 开启。",
-        metaText: "-",
-        lastSuccessText: "-",
-        lastSuccessTs: 0,
-      };
-    }
-
-    const ps = ps0;
+  // 把一份探测子状态映射成展示用 health。聚合状态与每条线路状态都用它，保证口径一致。
+  // 入参 sub：{ lastCheckedAt, lastResult, lastSuccessAt, lastErrorMessage, latencyMs, consecutiveFailures }
+  //   isAggregate：是否为聚合状态。仅聚合的连续失败数驱动「停自动探测」（见 getEffectiveRefreshMinutes，
+  //   只读聚合 consecutiveFailures）；单条线路在另一条还通时并不会真的停探，故 false 时不显示「已停止自动探测」。
+  // 出参：{ state, tone, label, description, metaText (副标签：耗时或相对时间), lastSuccessText, lastSuccessTs }
+  const statusFromProbe = (sub, enabled, isAggregate = true) => {
+    const ps = sub || {};
     const lastSuccessAt = toNumber(ps.lastSuccessAt);
     const lastSuccessText = lastSuccessAt > 0 ? formatTimeShort(lastSuccessAt) : "-";
 
@@ -372,7 +359,7 @@
     // 失败
     const errMsg = (ps.lastErrorMessage || "").toString().slice(0, 120) || "未知错误";
     const consecutive = toNumber(ps.consecutiveFailures);
-    const giveUp = enabled && consecutive >= GIVE_UP_FAILURE_COUNT;
+    const giveUp = isAggregate && enabled && consecutive >= GIVE_UP_FAILURE_COUNT;
     return {
       state: "unhealthy",
       tone: "danger",
@@ -384,6 +371,56 @@
       lastSuccessText,
       lastSuccessTs: lastSuccessAt,
     };
+  };
+
+  // 主动探测的健康状态：聚合 health（顶层字段，驱动徽标/通知/重试）+ 每条线路 health（health.targets[]，供面板逐条展示）。
+  // 聚合口径「任一线路成功即成功」已由后台写入 probeState 顶层字段（见 mergeProbeState），此处沿用，故现有消费方零改动。
+  const computeHealth = (probeState, config) => {
+    const enabled = normalizeHealthEnabled(config);
+    const ps0 = probeState || {};
+    // 关闭自动监测时，仍展示「最近一次手动探测」（点右上角刷新触发）的结果；
+    // 普通刷新一旦不再探测会清空 source，从而回落到「已关闭」
+    const hasManualProbe = ps0.source === "manual" && toNumber(ps0.lastCheckedAt) > 0;
+
+    // 没有 API 令牌时根本无法探测：优先提示（无论开关状态），避免「已关闭」却让用户点刷新探测的矛盾
+    if (!hasValidApiToken(config)) {
+      return {
+        state: "no-token",
+        tone: "idle",
+        label: "缺少 API 令牌",
+        description: "未配置 API 令牌，无法进行主动探测。",
+        metaText: "-",
+        lastSuccessText: "-",
+        lastSuccessTs: 0,
+        targets: [],
+      };
+    }
+
+    if (!enabled && !hasManualProbe) {
+      return {
+        state: "disabled",
+        tone: "idle",
+        label: "已关闭",
+        description: "自动检测已关闭（刷新间隔为 0）。点击右上角刷新按钮可手动探测一次，或将刷新间隔设为大于 0 开启。",
+        metaText: "-",
+        lastSuccessText: "-",
+        lastSuccessTs: 0,
+        targets: [],
+      };
+    }
+
+    // 聚合 health：沿用 probeState 顶层聚合字段（与改造前完全一致）
+    const aggregate = statusFromProbe(ps0, enabled);
+    // 每条线路独立 health，供面板渲染两行。isAggregate=false：单条线路失败不显示「已停止自动探测」
+    // （真正的停探只看聚合连续失败数，另一条还通时本条仍在随每次刷新被探测）。
+    const targets = (Array.isArray(ps0.targets) ? ps0.targets : []).map((t) => ({
+      key: t.key,
+      name: t.name,
+      host: hostOf(t.baseUrl),
+      ...statusFromProbe(t, enabled, false),
+    }));
+
+    return { ...aggregate, targets };
   };
 
   // 从 /api/subscription/self 提取活跃订阅
@@ -547,6 +584,7 @@
     PROBE_BASE_URL,
     PROBE_MODEL,
     PROBE_PATH,
+    PROBE_TARGETS,
     PROBE_TIMEOUT_MS,
     SUBSCRIPTION_SELF_PATH,
     QUOTA_PER_USD,
@@ -581,6 +619,7 @@
     getEffectiveRefreshMinutes,
     hasValidApiToken,
     hasValidConfig,
+    hostOf,
     normalizeAccessToken,
     normalizeApiToken,
     normalizeHealthEnabled,

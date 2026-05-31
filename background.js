@@ -81,6 +81,28 @@ const getActionState = (snapshot) => {
     };
   }
 
+  // 仅探测（未登录/登录失效但配了 API 令牌）：工具栏只反映 AI 健康，不展示额度
+  if (snapshot.state === "probe-only") {
+    const health = snapshot.health;
+    const enabled = snapshot.probeState?.enabled === true;
+    // 沿用「仅开启监测时才让 AI 异常染红」的约定，避免监测关时手动探测把工具栏卡红
+    const isAiDown = health?.state === "unhealthy" && enabled;
+    return {
+      badge: isAiDown ? "AI!" : "SET",
+      tone: isAiDown ? "danger" : "idle",
+      title: [
+        isAiDown
+          ? `AnyRouter：AI 探测失败（${health.description || "未知错误"}）`
+          : "AnyRouter Quota：仅站点检测（未登录）",
+        health?.label ? `AI 状态：${health.label}` : "",
+        "配置 Access Token + 用户 ID 可查看额度",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      ratio: null,
+    };
+  }
+
   if (snapshot.data) {
     const data = snapshot.data;
     const isStale = snapshot.state === "stale";
@@ -256,7 +278,34 @@ const clearNotification = (id) =>
     }
   });
 
-// 把本次 probe 结果累加到上次 probeState 上，跟踪 lastSuccessAt / consecutiveFailures。
+// 把一条线路的本轮结果滚动并到上次子状态上。res 形如 {key,name,baseUrl,success,latencyMs,errorMessage}。
+const mergeOne = (prevSub, res, now) => {
+  const sub = {
+    key: res.key,
+    name: res.name,
+    baseUrl: res.baseUrl,
+    lastCheckedAt: now,
+    lastSuccessAt: Number(prevSub?.lastSuccessAt) || 0,
+    lastResult: prevSub?.lastResult || null,
+    lastErrorMessage: prevSub?.lastErrorMessage || "",
+    latencyMs: Number(res.latencyMs) || 0,
+    consecutiveFailures: Number(prevSub?.consecutiveFailures) || 0,
+  };
+  if (res.success) {
+    sub.lastResult = "success";
+    sub.lastSuccessAt = now;
+    sub.lastErrorMessage = "";
+    sub.consecutiveFailures = 0;
+  } else {
+    sub.lastResult = "fail";
+    sub.lastErrorMessage = res.errorMessage || "未知错误";
+    sub.consecutiveFailures = (Number(prevSub?.consecutiveFailures) || 0) + 1;
+  }
+  return sub;
+};
+
+// 把本次 probe 结果累加到上次 probeState 上：聚合字段（驱动徽标/通知/重试/放弃）+ 各线路子状态 targets[]。
+// 聚合口径「任一线路成功即成功」：成功清零顶层连续失败，全失败才累加——故红色徽标/通知只在两条都挂时触发。
 // probeResult === null 表示本轮没探（关了或没令牌），保留旧状态但更新 enabled。
 const mergeProbeState = (prev, probeResult, enabled, source) => {
   const base = {
@@ -267,6 +316,8 @@ const mergeProbeState = (prev, probeResult, enabled, source) => {
     lastErrorMessage: prev?.lastErrorMessage || "",
     latencyMs: Number(prev?.latencyMs) || 0,
     consecutiveFailures: Number(prev?.consecutiveFailures) || 0,
+    // 各线路子状态：本轮未探测时原样带过上次的，供面板继续展示
+    targets: Array.isArray(prev?.targets) ? prev.targets : [],
     // 本轮未探测（probeResult === null）时清空 source；用于「关闭监测」下手动探测的结果
     // 在下一次普通刷新后回落到「已关闭」展示
     source: null,
@@ -278,6 +329,14 @@ const mergeProbeState = (prev, probeResult, enabled, source) => {
   base.lastCheckedAt = now;
   base.latencyMs = Number(probeResult.latencyMs) || 0;
   base.source = source === "manual" ? "manual" : "auto";
+
+  // 按 key 把上次子状态与本轮各线路结果合并
+  const prevByKey = {};
+  for (const sub of base.targets) {
+    if (sub && sub.key) prevByKey[sub.key] = sub;
+  }
+  const resultTargets = Array.isArray(probeResult.targets) ? probeResult.targets : [];
+  base.targets = resultTargets.map((res) => mergeOne(prevByKey[res.key], res, now));
 
   if (probeResult.success) {
     base.lastResult = "success";
@@ -293,13 +352,9 @@ const mergeProbeState = (prev, probeResult, enabled, source) => {
   return base;
 };
 
-// 主动探测：发一个最小请求到 /v1/messages，判断 AI 模型是否真的在响应。
-const probeAi = async (config) => {
-  if (!UsageQuota.hasValidApiToken(config)) {
-    return { success: false, latencyMs: 0, errorMessage: "缺少 API 令牌" };
-  }
-
-  const url = UsageQuota.buildProbeUrl(config);
+// 探测单条线路：发一个最小请求到该线路的 /v1/messages，判断 AI 模型是否真的在响应。
+const probeOne = async (config, target) => {
+  const url = UsageQuota.buildProbeUrl(target.baseUrl);
   const headers = UsageQuota.buildProbeHeaders(config);
   const body = UsageQuota.buildProbeBody(UsageQuota.PROBE_MODEL);
 
@@ -368,6 +423,62 @@ const probeAi = async (config) => {
   }
 };
 
+// 主动探测：对所有线路（主站 + 大陆直连）并发探测，判断 AI 模型是否真的在响应。
+// 聚合口径：任一线路成功即视为成功；仅当全部线路失败才算失败（驱动徽标/通知/重试）。
+// 返回 successCount（成功线路条数），供活跃度记账按实际计入 request_count 的探测数扣除。
+const probeAi = async (config) => {
+  const targets = UsageQuota.PROBE_TARGETS;
+
+  if (!UsageQuota.hasValidApiToken(config)) {
+    return {
+      success: false,
+      successCount: 0,
+      latencyMs: 0,
+      errorMessage: "缺少 API 令牌",
+      targets: targets.map((t) => ({
+        key: t.key,
+        name: t.name,
+        baseUrl: t.baseUrl,
+        success: false,
+        latencyMs: 0,
+        errorMessage: "缺少 API 令牌",
+      })),
+    };
+  }
+
+  const results = await Promise.all(
+    targets.map(async (t) => {
+      const r = await probeOne(config, t);
+      return {
+        key: t.key,
+        name: t.name,
+        baseUrl: t.baseUrl,
+        success: Boolean(r.success),
+        latencyMs: Number(r.latencyMs) || 0,
+        errorMessage: r.errorMessage || "",
+      };
+    })
+  );
+
+  const succeeded = results.filter((r) => r.success);
+  const successCount = succeeded.length;
+  const anySuccess = successCount > 0;
+
+  // 聚合时延：有成功线路取最快的（用户最关心「最快能多快通」）；全失败取最慢的（更能反映卡顿时长）
+  const latencyMs = anySuccess
+    ? Math.min(...succeeded.map((r) => r.latencyMs))
+    : results.reduce((max, r) => Math.max(max, r.latencyMs), 0);
+
+  // 全失败时给聚合错误信息，附一条线路的失败原因作示例
+  let errorMessage = "";
+  if (!anySuccess) {
+    const sample = results.find((r) => r.errorMessage)?.errorMessage || "未知错误";
+    errorMessage = `两条线路均失败（示例：${sample}）`;
+  }
+
+  return { success: anySuccess, successCount, latencyMs, errorMessage, targets: results };
+};
+
 // 仅在 healthy/unknown/disabled ↔ unhealthy 之间翻转时弹通知，避免每分钟重复打扰
 const maybeNotifyHealth = async (prevHealth, nextHealth, enabled) => {
   if (!nextHealth) return;
@@ -400,11 +511,42 @@ const maybeNotifyHealth = async (prevHealth, nextHealth, enabled) => {
   }
 };
 
+// 仅探测：未登录（无 Access Token/用户 ID）或登录失效时，只要配了 API 令牌就单独探测一次站点，
+// 不查额度。结果存成带 health 的快照供面板展示；手动点刷新与按间隔自动监控都走这里。
+const runProbeOnly = async (config, { previous = null, source = "manual" } = {}) => {
+  const healthEnabled = UsageQuota.normalizeHealthEnabled(config);
+  const probeResult = await probeAi(config);
+  const probeState = mergeProbeState(previous?.probeState, probeResult, healthEnabled, source);
+  const health = UsageQuota.computeHealth(probeState, config);
+
+  // 自动监控时 AI 异常/恢复照常通知；监测关闭（间隔=0）时 enabled=false，maybeNotifyHealth 自动不弹
+  const prevHealth = previous?.health || previous?.data?.health || null;
+  await maybeNotifyHealth(prevHealth, health, healthEnabled);
+
+  return setSnapshot({
+    state: "probe-only",
+    updatedAt: Date.now(),
+    errorMessage: "",
+    // 未登录没有额度数据；保留上次额度（若有），但面板在 probe-only 下只展示探测卡片
+    data: previous?.data || null,
+    health,
+    probeState,
+    activityState: previous?.activityState || null,
+  });
+};
+
 const fetchUsage = async ({ forceProbe = false } = {}) => {
   const config = await getConfig();
   const previous = await getSnapshot();
 
+  // 探测只需 API 令牌：未登录时无活跃/休眠状态，按 healthEnabled（间隔>0）或手动强制判定是否探测
+  const wantProbe =
+    (forceProbe || UsageQuota.normalizeHealthEnabled(config)) && UsageQuota.hasValidApiToken(config);
+  const probeSource = forceProbe ? "manual" : "auto";
+
   if (!UsageQuota.hasValidConfig(config)) {
+    // 未登录但配了 API 令牌：手动/自动都仍探测站点，不卡在「未配置」
+    if (wantProbe) return runProbeOnly(config, { previous, source: probeSource });
     return setSnapshot({
       state: "unconfigured",
       updatedAt: null,
@@ -428,6 +570,8 @@ const fetchUsage = async ({ forceProbe = false } = {}) => {
     const { response: userRes, body: userBody } = await fetchJson(userUrl, headers, controller.signal);
 
     if (isAuthFailure(userRes, userBody)) {
+      // 登录令牌失效：额度查不了，但有 API 令牌时仍探测站点，避免「登录过期连检测都用不了」
+      if (wantProbe) return runProbeOnly(config, { previous, source: probeSource });
       return setSnapshot({
         state: "unconfigured",
         updatedAt: null,
@@ -464,7 +608,6 @@ const fetchUsage = async ({ forceProbe = false } = {}) => {
     const healthEnabled = UsageQuota.normalizeHealthEnabled(config);
     const shouldProbe =
       ((healthEnabled && activity.mode === "active") || forceProbe) && UsageQuota.hasValidApiToken(config);
-    const probeSource = forceProbe ? "manual" : "auto";
     const probePromise = shouldProbe ? probeAi(config) : Promise.resolve(null);
 
     const [dataBody, logStatBody, subscriptionBody, probeResult] = await Promise.all([
@@ -507,7 +650,8 @@ const fetchUsage = async ({ forceProbe = false } = {}) => {
         baselined: true,
         lastUserRequestCount: activity.nextLastUserRequestCount,
         successfulProbeTotal:
-          UsageQuota.toNumber(prevActivity.successfulProbeTotal) + (probeResult?.success ? 1 : 0),
+          UsageQuota.toNumber(prevActivity.successfulProbeTotal) +
+          (probeResult ? UsageQuota.toNumber(probeResult.successCount) : 0),
         lastActivityAt: activity.lastActivityAt,
         mode: "active",
       };
@@ -537,14 +681,16 @@ const fetchUsage = async ({ forceProbe = false } = {}) => {
       error?.name === "AbortError" ? "请求超时，请检查平台地址或网络" : error?.message || "查询失败";
     const staleData = previous?.data || null;
 
-    // 本轮没有成功探测：清掉 source，让「关闭监测」下的手动探测结果回落到「已关闭」，
-    // 并据此重算 health —— 否则额度接口持续失败时，旧的「（手动）」结果/红色徽标会卡死
-    //（额度故障常与 AI 真实故障同时发生，正是最需要准确的时候）
+    // 额度查询失败时，若需要探测（手动点刷新，或开启监测）仍单独探一次——
+    // 额度故障常与 AI 真实故障同时发生，正是最需要准确探测结果的时候；点刷新也能刷新探测时间。
+    // 不需要探测时（无 API 令牌 / 监测关且非手动）按原逻辑传 null：让旧的手动探测结果回落、避免红色徽标卡死。
     const healthEnabled = UsageQuota.normalizeHealthEnabled(config);
-    const probeState = mergeProbeState(previous?.probeState, null, healthEnabled, "auto");
-    if (staleData) staleData.health = UsageQuota.computeHealth(probeState, config);
-    // health 可能从「AI 异常（手动）」回落，顺带清掉残留的故障通知（本轮没探测，不会误报新故障）
-    await maybeNotifyHealth(previous?.data?.health, staleData?.health, healthEnabled);
+    const probeResult = wantProbe ? await probeAi(config) : null;
+    const probeState = mergeProbeState(previous?.probeState, probeResult, healthEnabled, probeSource);
+    const health = UsageQuota.computeHealth(probeState, config);
+    if (staleData) staleData.health = health;
+    // health 据本轮探测结果重算；据此触发/清掉故障通知（即便没有旧额度数据也能正确告警）
+    await maybeNotifyHealth(previous?.data?.health || previous?.health, health, healthEnabled);
 
     // 刷新失败只写入快照给弹窗展示，不更新工具栏图标/徽标
     return setSnapshot(
@@ -555,7 +701,18 @@ const fetchUsage = async ({ forceProbe = false } = {}) => {
         errorMessage: message,
         data: staleData,
         probeState,
-        activityState: previous?.activityState, // 抓取失败：活跃状态原样保留，下个 tick 再判定
+        // 抓取失败但仍探测了（catch 路径不知是否休眠，按 wantProbe 探）：探测同样被平台计入
+        // request_count，必须把本轮成功探测数累加进 successfulProbeTotal，否则下个 tick 会把这些
+        // 探测请求误读成「用户在用 AI」、反复刷新 lastActivityAt 而把人永久卡在「活跃」、永不休眠。
+        // 全失败时 successCount=0 即原样保留；未探测（probeResult 为 null）时也原样保留，下个 tick 再判定。
+        activityState: probeResult
+          ? {
+              ...(previous?.activityState || {}),
+              successfulProbeTotal:
+                UsageQuota.toNumber(previous?.activityState?.successfulProbeTotal) +
+                UsageQuota.toNumber(probeResult.successCount),
+            }
+          : previous?.activityState,
       },
       { renderActionState: false }
     );
